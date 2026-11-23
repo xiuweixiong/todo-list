@@ -10,6 +10,8 @@
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
+# shellcheck source=runtime.sh
+. ./runtime.sh
 
 NS=todo
 HOST=127.0.0.1
@@ -33,9 +35,8 @@ skip() { SKIP=$((SKIP+1)); printf '  \033[33m-\033[0m %s\n' "$*"; }
 note() { printf '      %s\n' "$*"; }
 sec()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
-if command -v kubectl >/dev/null 2>&1; then K="kubectl"; else K="k3s kubectl"; fi
-command -v k3s >/dev/null 2>&1 || { echo "没找到 k3s，本脚本要在节点上跑"; exit 1; }
-$K get nodes >/dev/null 2>&1 || { echo "kubectl 连不上集群"; exit 1; }
+K=$(rt_kubectl) || { echo "没找到 kubectl（k3s 节点会退化成 k3s kubectl，也没有）。本脚本要在能连上集群的机器上跑"; exit 1; }
+$K get nodes >/dev/null 2>&1 || { echo "$K 连不上集群"; exit 1; }
 
 # ============ 1. 集群和存储 ============
 sec "1. 集群 / 存储"
@@ -47,10 +48,12 @@ PVC=$($K -n "$NS" get pvc todo-data -o jsonpath='{.status.phase}' 2>/dev/null)
   || bad "存储卷 todo-data 状态是 '$PVC'，应该是 Bound"
 
 # 数据实际落在哪，直接给路径，方便他自己去备份
-PV_PATH=$($K -n "$NS" get pvc todo-data -o jsonpath='{.spec.volumeName}' 2>/dev/null)
-if [ -n "$PV_PATH" ]; then
-  REAL=$(ls -d /var/lib/rancher/k3s/storage/*_${NS}_todo-data 2>/dev/null | head -1)
-  [ -n "$REAL" ] && note "数据目录：$REAL"
+SC=$($K -n "$NS" get pvc todo-data -o jsonpath='{.spec.storageClassName}' 2>/dev/null)
+[ -n "$SC" ] && note "StorageClass：$SC"
+if REAL=$(rt_pvc_dir "$NS" todo-data); then
+  note "数据目录：$REAL"
+else
+  note "数据目录不在本机（共享存储 / 非 local-path / 调度到别的节点），备份请用 ./backup.sh"
 fi
 
 # ============ 2. Pod ============

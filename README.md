@@ -63,11 +63,11 @@ cron 每 15 分钟 ──→ push-all.sh ──→ 遍历 users/*/ ──→ Ser
 ```
 
 - 网页和接口在**同一个 Pod** 里两个容器（nginx + api），中间走 `127.0.0.1`，不经过 Service
-- 用户数据落在 local-path 的 PVC 上，一个用户一个目录：`todos.sqlite` / `conf` / `last.log`
+- 用户数据落在 PVC 上的一个目录里（k3s 默认 `local-path`，标准 k8s 跟随你的默认 StorageClass），一个用户一个目录：`todos.sqlite` / `conf` / `last.log`
 - 推送每人每天一条，只推**「今天到期」和「已逾期」**，两类都没有就故意不发（省额度）
 - 每人填自己的 SendKey，免费版每天 5 条按 key 各自计算，互不影响
 
-部署步骤见 **[todo-push/k8s/README.md](todo-push/k8s/README.md)**。最小流程：
+部署步骤见 **[todo-push/k8s/README.md](todo-push/k8s/README.md)**。最小流程（k3s 和标准 k8s 都能跑，脚本自动识别容器运行时）：
 
 ```bash
 python _build/build.py                         # 先生成网页
@@ -75,6 +75,9 @@ cd todo-push/k8s
 ./deploy.sh --html ../todo-app/待办清单.html    # build 镜像 → 导入 containerd → apply → 传网页 → 自检
 ./check.sh                                     # 逐项自检（集群/网页/gzip/304/接口闭环/推送重试）
 ```
+
+不是 k3s？多两个可选参数：`--storage-class <名字>`（集群没有默认 StorageClass 时）、
+`--registry <仓库前缀>`（多节点集群，镜像推私有仓库）。详细差异见那份 README 的第三节。
 
 给使用者看的说明在 **[todo-push/用户引导.md](todo-push/用户引导.md)**，可以直接转发。
 

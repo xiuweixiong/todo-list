@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# 把镜像弄进 k3s 的 containerd。两个镜像：todo-push:1.0 和 nginx:1.27-alpine。
+# 把镜像弄进节点的 containerd。两个镜像：todo-push:1.0 和 nginx:1.27-alpine。
+#
+# 支持 k3s 和标准 k8s（containerd），运行时差异都在 runtime.sh 里处理：
+#   k3s        → k3s ctr
+#   标准 k8s   → ctr -n k8s.io（命名空间必须是 k8s.io，否则 kubelet 看不见）
+#   其他       → nerdctl -n k8s.io；crictl 只能拉不能导
 #
 # 为什么这一个脚本这么长 —— 因为这两个镜像的最优导入路径不一样：
 #
-#   todo-push:1.0      自己 build 的，本地 docker 里就有，走 docker save -> ctr import
+#   todo-push:1.0      自己 build 的，本地 docker 里就有，走 docker save -> images import
 #   nginx:1.27-alpine  官方镜像，带 attestation（构建溯源）清单，docker save 出来的
 #                      tar 里 index 会引用那些说明层，但 save 没把它们的 blob 写进去，
-#                      于是 ctr import 报 "content digest sha256:xxx: not found"，
+#                      于是导入时报 "content digest sha256:xxx: not found"，
 #                      加 --all-platforms / --digests 都没用（试过了）。
 #
 # 所以 nginx 走 containerd 自己的 pull：它解析 index 时会跳过不匹配平台和 attestation，
-# 拉下来是干净的。拉完再用 tag 改成 k8s 清单要的标准名。
+# 拉下来是干净的。拉完再打 tag 改成 k8s 清单要的标准名。
 #
 # 用法：
 #   ./import.sh                                  # 两个都弄
@@ -19,6 +24,8 @@
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
+# shellcheck source=runtime.sh
+. ./runtime.sh
 
 API_IMG=todo-push:1.0
 NGINX_IMG=nginx:1.27-alpine
@@ -42,7 +49,10 @@ ok()   { printf '\033[32m    OK\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[注意]\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[31m[失败]\033[0m %s\n' "$*" >&2; exit 1; }
 
-command -v k3s >/dev/null 2>&1 || die "没有 k3s"
+RT_BACKEND=$(rt_backend) || die "找不到容器运行时。k3s 节点上要有 k3s 命令；标准 k8s 节点上要有 ctr（containerd 自带）或 nerdctl。
+   检查：command -v k3s ctr nerdctl crictl"
+echo "    运行时：$(rt_backend_desc)"
+
 HAVE_DOCKER=0
 command -v docker >/dev/null 2>&1 && HAVE_DOCKER=1
 
@@ -55,30 +65,20 @@ esac
 
 have_docker_img() { [ "$HAVE_DOCKER" -eq 1 ] && docker image inspect "$1" >/dev/null 2>&1; }
 
-# containerd 里有没有这个完整名字
-ctr_has() {
-  k3s ctr images ls -q 2>/dev/null | grep -qxF "$1"
-}
-
-# containerd 里有没有某个结尾的名字（不管前缀），有就打印出来
-ctr_find_suffix() {
-  k3s ctr images ls -q 2>/dev/null | grep -F "$1" | head -3
-}
-
 # ---------- 1. todo-push:1.0 ----------
 say "1/4 检查 $API_IMG"
-if [ "$HAVE_DOCKER" -eq 0 ] && ! ctr_has "docker.io/library/$API_IMG"; then
-  die "既没有 docker，k3s 里也没有 $API_IMG。镜像得先在能 build 的机器上打好再传过来"
+if [ "$HAVE_DOCKER" -eq 0 ] && ! rt_img_has "docker.io/library/$API_IMG"; then
+  die "既没有 docker，节点里也没有 $API_IMG。镜像得先在能 build 的机器上打好再传过来"
 fi
 if have_docker_img "$API_IMG"; then
   ok "docker 里有 $API_IMG"
-elif ctr_has "docker.io/library/$API_IMG"; then
-  ok "k3s 里已经有 $API_IMG，跳过导入"
+elif rt_img_has "docker.io/library/$API_IMG"; then
+  ok "节点里已经有 $API_IMG，跳过导入"
 else
   die "docker 里没有 $API_IMG，先 build：cd .. && docker build -t $API_IMG ."
 fi
 
-# 磁盘空间：docker save 写满会把 tar 截断，import 时报错看着像镜像坏了
+# 磁盘空间：docker save 写满会把 tar 截断，导入时报错看着像镜像坏了
 AVAIL=$(df -Pk /tmp | awk 'NR==2{print int($4/1024)}')
 if [ "${AVAIL:-0}" -lt 1024 ]; then
   warn "/tmp 只剩 ${AVAIL}MB，可能写不下镜像包。先清理或换目录"
@@ -86,8 +86,8 @@ fi
 
 # ---------- 2. 导 todo-push:1.0 ----------
 say "2/4 导入 $API_IMG"
-if ctr_has "docker.io/library/$API_IMG"; then
-  ok "k3s 里已有，跳过"
+if rt_img_has "docker.io/library/$API_IMG"; then
+  ok "节点里已有，跳过"
 elif ! have_docker_img "$API_IMG"; then
   warn "docker 里没有 $API_IMG，跳过"
 else
@@ -108,13 +108,20 @@ else
       rm -f "$tar"
     else
       echo "    $(du -h "$tar" | cut -f1)  $tar，包内 $(wc -l < /tmp/k3s-tar-list.txt) 个条目"
-      if k3s ctr images import "$tar" 2>/tmp/k3s-import.err; then
+      if rt_img_import "$tar" 2>/tmp/k3s-import.err; then
         ok "已导入"
-      elif k3s ctr images import --all-platforms "$tar" 2>>/tmp/k3s-import.err; then
+      elif rt_img_import "$tar" --all-platforms 2>>/tmp/k3s-import.err; then
         ok "已导入（--all-platforms）"
       else
         warn "导入失败，报错："
         sed 's/^/      /' /tmp/k3s-import.err | tail -6
+        case "$RT_BACKEND" in
+          crictl)
+            warn "crictl 不支持从 tar 导入。换成 ctr 再跑："
+            echo "      ctr -n k8s.io images import $tar"
+            echo "      或者把镜像推到私有仓库，用 ./deploy.sh --registry <前缀>"
+            ;;
+        esac
       fi
       rm -f "$tar"
     fi
@@ -125,33 +132,33 @@ fi
 say "3/4 准备 $NGINX_IMG"
 if [ "$SKIP_NGINX" -eq 1 ]; then
   echo "    --skip-nginx，跳过"
-elif ctr_has "$NGINX_FULL"; then
-  ok "k3s 里已经有 $NGINX_FULL，跳过"
+elif rt_img_has "$NGINX_FULL"; then
+  ok "节点里已经有 $NGINX_FULL，跳过"
 else
-  # 可能之前以带镜像源前缀的名字躺在里面了，直接 tag 成标准名，零网络
-  EXIST=$(ctr_find_suffix "nginx:1.27-alpine")
+  # 可能之前以带镜像源前缀的名字躺在里面了，直接打 tag 成标准名，零网络
+  EXIST=$(rt_img_find "nginx:1.27-alpine")
   if [ -n "$EXIST" ]; then
     echo "    containerd 里已有同版本镜像，打上标准名（不联网）："
     printf '%s\n' "$EXIST" | sed 's/^/      /'
     for src in $EXIST; do
       [ "$src" = "$NGINX_FULL" ] && continue
-      if k3s ctr images tag "$src" "$NGINX_FULL" 2>/dev/null; then
+      if rt_img_tag "$src" "$NGINX_FULL" 2>/dev/null; then
         ok "tagged $src -> $NGINX_FULL"
         break
       fi
     done
   fi
 
-  # 首选：containerd 自己 pull。绕开 docker save/import 的 attestation 问题
-  if ! ctr_has "$NGINX_FULL"; then
+  # 首选：containerd 自己拉。绕开 docker save/import 的 attestation 问题
+  if ! rt_img_has "$NGINX_FULL"; then
     echo "    从 $NGINX_REF 直接拉到 containerd（绕过 docker save/import）"
-    PULL_ARGS=()
-    [ -n "$PLATFORM" ] && PULL_ARGS+=(--platform "$PLATFORM")
-    if k3s ctr images pull "${PULL_ARGS[@]}" "$NGINX_REF" 2>/tmp/k3s-pull.err; then
+    if rt_img_pull "$NGINX_REF" "$NGINX_FULL" "$PLATFORM" 2>/tmp/k3s-pull.err; then
       ok "拉取成功"
       if [ "$NGINX_REF" != "$NGINX_FULL" ]; then
-        if k3s ctr images tag "$NGINX_REF" "$NGINX_FULL" 2>/dev/null; then
+        if rt_img_tag "$NGINX_REF" "$NGINX_FULL" 2>/dev/null; then
           ok "已改名为 $NGINX_FULL（k8s 清单要的就是这个）"
+        elif [ "$RT_BACKEND" = "crictl" ]; then
+          ok "crictl 直接按标准名拉的，不需要改名"
         else
           warn "改名失败，只能让清单直接用 $NGINX_REF"
           echo "      补救：kubectl -n todo set image deploy/todo-app web=$NGINX_REF"
@@ -171,13 +178,13 @@ else
           safe=nginx
           tar=/tmp/k3s-import-$safe.tar
           if docker save "$NGINX_REF" -o "$tar" 2>/dev/null; then
-            k3s ctr images import --all-platforms "$tar" 2>/tmp/k3s-import2.err \
+            rt_img_import "$tar" --all-platforms 2>/tmp/k3s-import2.err \
               && ok "已导入（docker 路线）" \
               || { warn "import 仍失败："; sed 's/^/      /' /tmp/k3s-import2.err | tail -4; }
             rm -f "$tar"
           fi
           # save 出来的名字带前缀，tag 一下
-          k3s ctr images tag "$NGINX_REF" "$NGINX_FULL" 2>/dev/null && ok "已改名为 $NGINX_FULL"
+          rt_img_tag "$NGINX_REF" "$NGINX_FULL" 2>/dev/null && ok "已改名为 $NGINX_FULL"
         fi
       fi
     fi
@@ -185,23 +192,20 @@ else
 fi
 
 # ---------- 4. 校验 ----------
-say "4/4 校验 k3s 镜像库"
-LIST=$(k3s ctr images ls -q 2>/dev/null)
+say "4/4 校验镜像库"
+LIST=$(rt_img_ls 2>/dev/null)
 FAIL=0
-for pair in "docker.io/library/$API_IMG|$API_IMG"; do
-  want=${pair%%|*}; name=${pair##*|}
-  if printf '%s\n' "$LIST" | grep -qxF "$want"; then
-    ok "$name 在 k3s 里"
-  else
-    warn "$name 不在 k3s 里"
-    FAIL=1
-  fi
-done
+if printf '%s\n' "$LIST" | grep -qxF "docker.io/library/$API_IMG"; then
+  ok "$API_IMG 在节点里"
+else
+  warn "$API_IMG 不在节点里"
+  FAIL=1
+fi
 if [ "$SKIP_NGINX" -eq 0 ]; then
   if printf '%s\n' "$LIST" | grep -qxF "$NGINX_FULL"; then
-    ok "$NGINX_IMG 在 k3s 里"
+    ok "$NGINX_IMG 在节点里"
   else
-    warn "$NGINX_IMG 不在 k3s 里（Pod 会卡在 ImagePullBackOff）"
+    warn "$NGINX_IMG 不在节点里（Pod 会卡在 ImagePullBackOff）"
     FAIL=1
   fi
 fi
@@ -211,20 +215,25 @@ if [ "$FAIL" -ne 0 ]; then
 
     镜像没进去。按这个顺序查：
 
-      1) 现在 containerd 里到底有什么：
-           k3s ctr images ls -q | grep -i nginx
+      1) 现在 containerd 里到底有什么（当前后端：$(rt_backend_desc)）：
+           $(rt_hint_cmd)
         如果看到的是带前缀的名字（如 $NGINX_REF），
         手动改名即可，不用重新拉：
-           k3s ctr images tag $NGINX_REF $NGINX_FULL
+           ctr -n k8s.io images tag $NGINX_REF $NGINX_FULL
+         （k3s 上把 "ctr -n k8s.io" 换成 "k3s ctr"）
 
       2) 换一家镜像源（实测能用的另外两个）：
            ./import.sh --nginx-ref docker.1ms.run/library/nginx:1.27-alpine
            ./import.sh --nginx-ref docker.1panel.live/library/nginx:1.27-alpine
 
       3) 磁盘：
-           df -h /tmp /var/lib/rancher
-         空间不足会让 docker save 写出残包，import 时表现为
+           df -h /tmp /var/lib/rancher /var/lib/containerd
+         空间不足会让 docker save 写出残包，导入时表现为
          "content digest ... not found" —— 看着像镜像坏了，其实是没写全
+
+      4) 多节点集群：本脚本只处理当前这台机器。
+         别的节点要么也跑一遍，要么用 ./deploy.sh --registry <私有仓库前缀>
+         把镜像推到仓库，让每台节点自己拉。
 
 HINT
   exit 1

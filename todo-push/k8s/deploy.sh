@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# 在 k3s 节点上执行。做五件事：构建镜像 -> 导入 containerd -> 部署 -> 传网页 -> 自检
+# 在集群节点上执行。做五件事：构建镜像 -> 镜像就位 -> 部署 -> 传网页 -> 自检
+#
+# k3s 和标准 k8s 都能跑（运行时差异见 runtime.sh）。
 #
 #   ./deploy.sh                        # 全套（节点上要装 docker）
-#   ./deploy.sh --skip-build           # 镜像已经 build 好并导入过了
+#   ./deploy.sh --skip-build           # 镜像已经好了，只部署
 #   ./deploy.sh --html /path/x.html    # 指定网页文件
 #   ./deploy.sh --base <镜像地址>       # 拉不到 Docker Hub 时换基础镜像
 #   ./deploy.sh --nginx <镜像地址>      # 换 nginx 来源（默认 daocloud）
 #   ./deploy.sh --apt-mirror <域名>     # 容器内 apt 卡住时指定 Debian 源
-#                                       # （不指定也行，Dockerfile 会自己挨个试）
+#
+# 标准 k8s 额外两个参数（k3s 一般用不上）：
+#   ./deploy.sh --storage-class longhorn    # 指定 PVC 的 StorageClass
+#   ./deploy.sh --storage-class -           # 不指定，用集群默认（默认就是这行为）
+#   ./deploy.sh --registry registry.x.com/todo   # 推到私有仓库，多节点必备
 #
 # 两个镜像：todo-push:1.0（自己 build）+ nginx:1.27-alpine（网页服务）。
 # nginx 由 import.sh 用 containerd 直接拉，不走 docker save（那条路会撞上
@@ -21,17 +27,22 @@
 #        --nginx docker.m.daocloud.io/library/nginx:1.27-alpine
 #
 # 重复执行安全：apply 是幂等的，网页会被覆盖成新版。
+# 已有 PVC 不会重复 apply（storageClassName 不可变，硬 apply 会报错）。
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
+# shellcheck source=runtime.sh
+. ./runtime.sh
 
 NS=todo
-TAG=todo-push:1.0
+LOCAL_TAG=todo-push:1.0
 HTML=""
 SKIP_BUILD=0
 BASE_IMAGE=""
 APT_MIRROR=""
 NGINX_REF=""
+STORAGE_CLASS=""
+REGISTRY=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,37 +51,61 @@ while [ $# -gt 0 ]; do
     --base)  BASE_IMAGE="${2:?--base 后面要跟镜像地址}"; shift 2 ;;
     --nginx) NGINX_REF="${2:?--nginx 后面要跟镜像地址}"; shift 2 ;;
     --apt-mirror) APT_MIRROR="${2:?--apt-mirror 后面要跟域名，如 mirrors.cloud.tencent.com}"; shift 2 ;;
-    *) echo "用法: $0 [--skip-build] [--html 文件] [--base 镜像] [--nginx 镜像] [--apt-mirror 域名]"; exit 1 ;;
+    --storage-class) STORAGE_CLASS="${2:?--storage-class 后面要跟 StorageClass 名字，或 - 表示用默认}"; shift 2 ;;
+    --registry) REGISTRY="${2:?--registry 后面要跟仓库前缀，如 registry.example.com/todo}"; shift 2 ;;
+    *) echo "用法: $0 [--skip-build] [--html 文件] [--base 镜像] [--nginx 镜像] [--apt-mirror 域名] [--storage-class 名字|-] [--registry 前缀]"; exit 1 ;;
   esac
 done
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()  { printf '\033[32m    OK\033[0m %s\n' "$*"; }
+note(){ printf '    %s\n' "$*"; }
 die() { printf '\n\033[31m[失败]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# k3s 节点上不一定有独立的 kubectl，用 k3s kubectl 兜底
-if command -v kubectl >/dev/null 2>&1; then K="kubectl"; else K="k3s kubectl"; fi
-command -v k3s >/dev/null 2>&1 || die "没找到 k3s"
-$K get nodes >/dev/null 2>&1 || die "kubectl 连不上集群"
+# ---------- 0. 环境探测 ----------
+K=$(rt_kubectl) || die "没找到 kubectl（k3s 节点上会退化成 k3s kubectl，也没找到）
+   标准 k8s：kubectl 应该在 PATH 里；k3s：确认 k3s 命令可用"
+$K get nodes >/dev/null 2>&1 || die "kubectl 连不上集群（检查 KUBECONFIG / 是否在 master 节点上）"
+
+RT_BACKEND=""
+if [ -z "$REGISTRY" ]; then
+  RT_BACKEND=$(rt_backend) || die "找不到容器运行时，镜像没法进节点。
+   有 docker 也不够——kubelet 只认 containerd 里的镜像。检查：
+     command -v k3s ctr nerdctl crictl"
+  note "kubectl：$K"
+  note "运行时：$(rt_backend_desc)"
+else
+  note "kubectl：$K"
+  note "镜像走私有仓库：$REGISTRY（跳过本地导入，多节点各自去拉）"
+fi
+
+# 镜像最终名字
+if [ -n "$REGISTRY" ]; then
+  REGISTRY="${REGISTRY%/}"      # 去掉尾部斜杠，免得出现 // 
+  IMG="$REGISTRY/todo-push:1.0"
+else
+  IMG="$LOCAL_TAG"
+fi
 
 # ---------- 1. 构建镜像 ----------
 if [ "$SKIP_BUILD" -eq 0 ]; then
-  say "1/5 构建镜像 $TAG"
+  say "1/5 构建镜像 $LOCAL_TAG"
   command -v docker >/dev/null 2>&1 || die "节点上没有 docker。请在能 build 的机器上打好镜像再传过来，然后加 --skip-build"
 
   # --base / --apt-mirror 都是可选参数，只在传了的时候才加进命令行
   BUILD_ARGS=()
   if [ -n "$BASE_IMAGE" ]; then
     BUILD_ARGS+=(--build-arg "BASE_IMAGE=$BASE_IMAGE")
-    echo "    基础镜像：$BASE_IMAGE"
+    note "基础镜像：$BASE_IMAGE"
   else
-    echo "    基础镜像：Dockerfile 默认（docker.m.daocloud.io/library/python:3.11-slim）"
+    note "基础镜像：Dockerfile 默认（docker.m.daocloud.io/library/python:3.11-slim）"
   fi
   if [ -n "$APT_MIRROR" ]; then
     BUILD_ARGS+=(--build-arg "APT_MIRROR=$APT_MIRROR")
-    echo "    apt 源：$APT_MIRROR"
+    note "apt 源：$APT_MIRROR"
   fi
 
-  if ! docker build "${BUILD_ARGS[@]}" -t "$TAG" ../ 2>&1 | tail -40; then
+  if ! docker build "${BUILD_ARGS[@]}" -t "$LOCAL_TAG" ../ 2>&1 | tail -40; then
     cat <<'HINT'
 
     构建失败。对号入座：
@@ -107,22 +142,96 @@ else
   say "1/5 跳过构建"
 fi
 
-# ---------- 2. 导入 containerd ----------
-# 两个镜像都要进去：todo-push:1.0 走 docker save，nginx 走 containerd 直接 pull
-# （原因见 import.sh 开头的注释）。导入失败在这里就中止，不等 Pod 卡 ImagePullBackOff。
-say "2/5 导入镜像到 k3s"
-IMPORT_ARGS=()
-if [ -n "$NGINX_REF" ]; then
-  IMPORT_ARGS+=(--nginx-ref "$NGINX_REF")
-  echo "    nginx 来源：$NGINX_REF"
+# ---------- 2. 镜像就位 ----------
+if [ -n "$REGISTRY" ]; then
+  say "2/5 推镜像到 $REGISTRY"
+  command -v docker >/dev/null 2>&1 || die "推仓库需要 docker（用来 tag 和 push）"
+  docker image inspect "$LOCAL_TAG" >/dev/null 2>&1 || die "本地没有 $LOCAL_TAG，先建一次再推（去掉 --skip-build）"
+  docker tag "$LOCAL_TAG" "$IMG"
+  docker push "$IMG" || die "push 失败。检查 3 件事：
+   1) 有没有登录：docker login $REGISTRY
+   2) 仓库里那个项目（命名空间）建了吗
+   3) 节点上有没有对应的 imagePullSecrets（私有仓库要配，见 README）"
+  ok "已推送 $IMG"
+  note "注意：清单里 imagePullPolicy 是 IfNotPresent，同名 tag 重复推不会自动更新。"
+  note "     真要更新请在 Dockerfile 里改版本号，或者临时改成 Always。"
+else
+  say "2/5 导入镜像到节点"
+  IMPORT_ARGS=()
+  if [ -n "$NGINX_REF" ]; then
+    IMPORT_ARGS+=(--nginx-ref "$NGINX_REF")
+    note "nginx 来源：$NGINX_REF"
+  fi
+  bash ./import.sh "${IMPORT_ARGS[@]}" || die "镜像没进节点。上面有逐条结论，Pod 现在起了也会 ImagePullBackOff"
 fi
-bash ./import.sh "${IMPORT_ARGS[@]}" || die "镜像没导进 k3s。上面有逐条结论，Pod 现在起了也会 ImagePullBackOff"
 
 # ---------- 3. 部署 ----------
 say "3/5 应用清单"
-$K apply -f todo-push.yaml
+
+# 把多文档清单拆开，才能做到"已有 PVC 不重复 apply"
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
+# 目录通过环境变量传给 awk：用 -v 传带反斜杠的路径（Windows）会被当成转义序列
+SPLIT_DIR="$TMPD" awk '
+  BEGIN { n = 0; d = ENVIRON["SPLIT_DIR"] }
+  /^---[[:space:]]*$/ { n++; next }
+  { print > (d "/m" n ".yaml") }
+' todo-push.yaml
+
+NS_FILE=""; PVC_FILE=""; REST=()
+for f in "$TMPD"/m*.yaml; do
+  [ -f "$f" ] || continue
+  grep -q '^kind:' "$f" || { rm -f "$f"; continue; }
+  case "$(grep -m1 '^kind:' "$f" | awk '{print $2}')" in
+    Namespace)               NS_FILE=$f ;;
+    PersistentVolumeClaim)   PVC_FILE=$f ;;
+    *)                       REST+=("$f") ;;
+  esac
+done
+
+# 指定了 StorageClass 就写进 PVC 那一段（没指定则保持注释状态，跟随集群默认）
+if [ -n "$STORAGE_CLASS" ] && [ "$STORAGE_CLASS" != "-" ] && [ -n "$PVC_FILE" ]; then
+  if grep -q '^  # storageClassName:' "$PVC_FILE"; then
+    sed -i "s|^  # storageClassName:.*|  storageClassName: $STORAGE_CLASS|" "$PVC_FILE"
+  else
+    sed -i "/^spec:/a\\  storageClassName: $STORAGE_CLASS" "$PVC_FILE"
+  fi
+  note "StorageClass：$STORAGE_CLASS"
+fi
+
+# 用私有仓库时，把清单里的镜像名换掉
+if [ -n "$REGISTRY" ]; then
+  for f in "${REST[@]}"; do
+    sed -i "s|image: $LOCAL_TAG|image: $IMG|g" "$f"
+  done
+fi
+
+# 顺序：命名空间 -> PVC（不存在才建） -> 其余
+if [ -n "$NS_FILE" ]; then
+  $K apply -f "$NS_FILE" >/dev/null
+fi
+
+if [ -n "$PVC_FILE" ]; then
+  if $K -n "$NS" get pvc todo-data >/dev/null 2>&1; then
+    CUR=$($K -n "$NS" get pvc todo-data -o jsonpath='{.spec.storageClassName}' 2>/dev/null) || CUR=""
+    note "PVC todo-data 已存在（StorageClass=${CUR:-集群默认}），跳过，不动它"
+    if [ -n "$STORAGE_CLASS" ] && [ "$STORAGE_CLASS" != "-" ] && [ "$STORAGE_CLASS" != "$CUR" ]; then
+      note "  你传的 --storage-class $STORAGE_CLASS 不会生效：PVC 的 StorageClass 创建后不可改。"
+      note "  真要换：先 ./backup.sh 备份，再删 PVC（数据会丢）后重跑。"
+    fi
+  else
+    $K apply -f "$PVC_FILE" >/dev/null
+    note "PVC todo-data 已创建"
+  fi
+fi
+
+if [ "${#REST[@]}" -eq 0 ]; then
+  die "清单解析异常：todo-push.yaml 里没找到 Deployment / Service / CronJob，检查文件有没有被改坏"
+fi
+$K apply -f "${REST[@]}"
 $K -n "$NS" rollout status deploy/todo-app --timeout=180s || \
-  die "Pod 没起来，看：$K -n $NS describe pod -l app=todo-app"
+  die "Pod 没起来，看：$K -n $NS describe pod -l app=todo-app
+   常见原因：PVC 没绑上（kubectl -n $NS get pvc）、镜像不在节点（kubectl -n $NS describe pod 看 Events）"
 
 # ---------- 4. 传网页 ----------
 if [ -z "$HTML" ]; then
@@ -137,23 +246,25 @@ if [ -z "$HTML" ] || [ ! -f "$HTML" ]; then
   echo "    POD=\$($K -n $NS get pod -l app=todo-app -o jsonpath='{.items[0].metadata.name}')"
   echo "    $K -n $NS cp 待办清单.html \$POD:/data/www/index.html -c api"
 else
-  POD=$($K -n "$NS" get pod -l app=todo-app -o jsonpath='{.items[0].metadata.name}')
+  POD=$($K -n "$NS" get pod -l app=todo-app -o jsonpath='{.items[0].metadata.name}') || POD=""
   # 必须写进 api 容器：web 容器（nginx）的 /data 是 readOnly 挂载，
   # 往 web 里 cp 会直接报 Read-only file system。
   if $K -n "$NS" cp "$HTML" "$POD:/data/www/index.html" -c api; then
     echo "    已传到 $POD:/data/www/index.html（$(du -h "$HTML" | cut -f1)）"
   else
-    # kubectl cp 依赖容器里有 tar，且目录属主得对。不通就走 local-path 直拷——
-    # 数据本来就在本机磁盘上，绕开容器反而更快。
-    echo "    [kubectl cp 失败] 改用节点直拷（local-path 的数据就在本机）："
-    DIR=$(ls -d /var/lib/rancher/k3s/storage/*_${NS}_todo-data 2>/dev/null | head -1)
-    if [ -n "$DIR" ] && [ -d "$DIR" ]; then
+    # kubectl cp 依赖容器里有 tar，且目录属主得对。不通就直接写宿主机目录——
+    # 数据本来就在本机磁盘上，绕开容器反而更快。路径由 runtime.sh 探测
+    # （local-path 在 /var/lib/rancher/k3s/storage，hostPath 直接读 PV 定义）。
+    echo "    [kubectl cp 失败] 改用节点直拷："
+    if DIR=$(rt_pvc_dir "$NS" todo-data); then
       mkdir -p "$DIR/www"
       cp "$HTML" "$DIR/www/index.html" && chown 1000:1000 "$DIR/www" "$DIR/www/index.html" \
         && echo "    已直接写入 $DIR/www/index.html" \
         || echo "    直拷也失败了，检查 $DIR 的权限"
     else
-      echo "    没找到数据目录（PVC 不是 local-path？）"
+      echo "    没找到数据目录（PV 不是 local-path / hostPath，或者不是在这台节点上）"
+      echo "    多节点 + 共享存储时只能靠 kubectl cp，先看容器里有没有 tar："
+      echo "      $K -n $NS exec deploy/todo-app -c api -- which tar"
     fi
   fi
 
@@ -175,7 +286,9 @@ fi
 
 # ---------- 5. 自检 ----------
 say "5/5 自检"
-NODE_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# hostname -I 是 iproute2 扩展，busybox / 精简系统没有；配合 set -e 会在这里
+# 把整个脚本搞成"部署成功了却报失败"，所以失败也要吞掉
+NODE_IP=$(hostname -I 2>/dev/null | awk '{print $1}') || NODE_IP=""
 NODE_IP=${NODE_IP:-节点IP}
 sleep 2
 U=http://127.0.0.1:30080

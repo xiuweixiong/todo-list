@@ -10,7 +10,11 @@
 
 set -euo pipefail
 NS=todo
-if command -v kubectl >/dev/null 2>&1; then K="kubectl"; else K="k3s kubectl"; fi
+# 运行时探测（k3s / 标准 k8s 都认），不改变当前目录，备份文件仍落到你执行时的位置
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=runtime.sh
+. "$HERE/runtime.sh"
+K=$(rt_kubectl) || { echo "没找到 kubectl（k3s 节点会退化成 k3s kubectl，也没有）"; exit 1; }
 POD=$($K -n "$NS" get pod -l app=todo-app -o jsonpath='{.items[0].metadata.name}')
 [ -n "$POD" ] || { echo "找不到 todo-app 的 Pod，先 kubectl -n $NS get pod"; exit 1; }
 

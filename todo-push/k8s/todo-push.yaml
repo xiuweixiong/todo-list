@@ -1,13 +1,13 @@
-# 待办清单 · k3s 部署清单（一个文件装完所有东西）
+# 待办清单 · k8s 部署清单（一个文件装完所有东西）
 #
 #   kubectl apply -f todo-push.yaml
 #
 # 包含：命名空间 / 存储卷 / nginx 配置 / 应用（nginx+api 两个容器一个 Pod）
 #      / 对外服务 / 每 15 分钟的推送任务
 #
-# 存储用的是 k3s 自带的 local-path，数据真实落在节点上的
-#   /var/lib/rancher/k3s/storage/pvc-xxxx_todo_todo-data/
-# 想放到自己指定目录（比如 /opt/data/todo），见 README 的「存储」一节。
+# k3s 和标准 k8s 通用（全部是 stable API）。两处差异见下面的注释：
+#   1) 存储：不写死 StorageClass，跟随集群默认（k3s 上默认就是 local-path）
+#   2) 镜像：默认用本地导入的 todo-push:1.0；多节点请换私有仓库，见 README
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -21,7 +21,14 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: local-path
+  # 【注意】这里故意不写 storageClassName，意思是"用集群的默认 StorageClass"：
+  #   k3s            → 默认就是 local-path，数据落在 /var/lib/rancher/k3s/storage/
+  #   标准 k8s 有默认 → 跟随它（Longhorn / cephfs / nfs-subdir 都行）
+  #   标准 k8s 没有默认 → PVC 会一直 Pending，两种解法：
+  #       A. 指定现成的：kubectl get sc 看一眼，然后 ./deploy.sh --storage-class <名字>
+  #       B. 一个 SC 都没有：手写 hostPath PV，清单在 README「标准 k8s」一节
+  # 已有 PVC 的 storageClassName 是不可变的，改它必须先删 PVC（数据会没，先备份）。
+  # storageClassName: local-path
   resources:
     requests:
       storage: 2Gi
@@ -104,6 +111,11 @@ spec:
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
+
+      # 【镜像从哪来】todo-push:1.0 是本地 build 的，没有仓库。
+      #   单节点：./import.sh 导进 containerd 就行（IfNotPresent 不会去拉）。
+      #   多节点：必须推到私有仓库，否则 Pod 调度到没导镜像的节点会 ImagePullBackOff。
+      #           用 ./deploy.sh --registry registry.example.com/todo 自动改这段清单。
 
       # 卷挂上去之前先把目录建好，否则 nginx 因为 root 目录不存在直接 404。
       # /data/www 必须一起 chown：api 容器是 uid 1000，属主是 root 的话网页传不进去

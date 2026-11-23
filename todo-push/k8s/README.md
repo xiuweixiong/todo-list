@@ -1,7 +1,11 @@
-# k3s 部署说明
+# k8s 部署说明（k3s 和标准 k8s 都适用）
 
-Debian 11 + k3s。和前面那套 `install.sh`（裸机 systemd + nginx + cron）**二选一**，
-数据格式完全一样，以后想换回来直接拷 `users/` 目录就行。
+清单全部是 stable API，脚本会自动识别容器运行时（`k3s ctr` / `ctr -n k8s.io` /
+`nerdctl` / `crictl`），所以 kubeadm、k3s、k0s、RKE2 都能用。差别只有三处，
+见下面的「一·五」——**不是 k3s 的先看那张表，能省掉一次 PVC 卡 Pending**。
+
+> 和 `install.sh`（裸机 systemd + nginx + cron）**二选一**，数据格式完全一样，
+> 以后想换回来直接拷 `users/` 目录就行。
 
 ---
 
@@ -30,6 +34,22 @@ CronJob Pod ──────────────────────�
 
 **为什么网页不塞进镜像**：网页 7.8MB，每次改版都要重打镜像、重导镜像太笨。放卷里，
 换网页只是 `kubectl cp` 一个文件，刷新即生效，nginx 和 api 都不用重启。
+
+---
+
+## 一·五、不是 k3s？先看这三处差异
+
+| 事项 | k3s | 标准 k8s（kubeadm / k0s / RKE2） | 你要做什么 |
+|---|---|---|---|
+| **镜像怎么进节点** | `k3s ctr` | `ctr -n k8s.io`（**命名空间不是 k8s.io，kubelet 就看不见**） | 不用管，`import.sh` 自动探测 |
+| **StorageClass** | 自带 `local-path` 且是集群默认 | 多数集群一个 SC 都没有 | 有默认 SC 就什么都不用做；没有就看第八节 |
+| **多节点** | 一般单机 | 通常多节点，每台都要有镜像 | 用 `--registry` 推私有仓库 |
+
+清单里已经把 `storageClassName` 注释掉了，意思是「跟随集群默认」——k3s 上仍然是
+`local-path`，标准 k8s 上跟随你的默认 SC，**两种都不用手改 yaml**。
+
+只有一种情况必须动手：集群里**一个 StorageClass 都没有**（`kubectl get sc` 空着）。
+那时 PVC 会一直 Pending，Pod 卡在 `ContainerCreating`，解法见第八节。
 
 ---
 
@@ -257,14 +277,24 @@ bash ../test-push.sh SCT你的SendKey --dry        # 只看地址，不发，不
 
 ### 数据到底落在哪
 
-k3s 自带 `local-path` 这个 StorageClass，PVC 绑定后，真实目录在**节点的磁盘**上：
+PVC 绑定后，真实目录在**节点的磁盘**上。路径取决于 StorageClass：
 
 ```bash
-k3s kubectl -n todo get pvc todo-data
-# 拿到 pvc-xxxxxxxx 这个名字后
-ls -l /var/lib/rancher/k3s/storage/pvc-xxxxxxxx_todo_todo-data/
-#   ├── www/index.html
-#   └── users/a3f9c1d2e7b40f58/{todos.sqlite,conf,.sent}
+# 让脚本直接告诉你（k3s / 标准 k8s 通用，会读 PV 定义和几个常见位置）
+./check.sh | grep 数据目录
+
+# 自己看也行：
+kubectl -n todo get pvc todo-data -o jsonpath='{.spec.storageClassName}{"\n"}'
+kubectl get pv $(kubectl -n todo get pvc todo-data -o jsonpath='{.spec.volumeName}') -o yaml | grep -A3 hostPath
+```
+
+两种常见结果：
+
+```
+k3s 默认 local-path  → /var/lib/rancher/k3s/storage/pvc-xxxxxxxx_todo_todo-data/
+自己写的 hostPath PV → /opt/data/todo/          （你在 PV 里指定的那个路径）
+    ├── www/index.html
+    └── users/a3f9c1d2e7b40f58/{todos.sqlite,conf,.sent}
 ```
 
 它是**节点本地盘**，不是网络存储。含义很直接：
@@ -307,11 +337,21 @@ spec:
     type: DirectoryOrCreate
 ```
 
-然后把 PVC 里的 `storageClassName` 改成 `todo-local` 再 apply。之后备份就是熟悉的：
+然后指定它即可，不用手改 yaml：
+
+```bash
+./deploy.sh --skip-build --storage-class todo-local
+```
+
+之后备份就是熟悉的：
 
 ```bash
 tar -czf /opt/backup/todo-$(date +%F).tar.gz -C /opt/data/todo users
 ```
+
+> **PVC 的 storageClassName 创建后不可改。** 已经部署过再想换，必须先删 PVC
+> （数据一起没，先 `./backup.sh`），所以一开始就定好。`deploy.sh` 检测到 PVC
+> 已存在会直接跳过，不会去动它。
 
 两种都行，看你习惯：
 `local-path` 少写 20 行 yaml；`hostPath + Retain` 路径可控、误删 PVC 不丢数据。
@@ -461,3 +501,160 @@ k3s kubectl -n todo rollout restart deploy/todo-app     # 让 nginx 重读配置
 | 卷 | 实际用不到 5MB |
 
 一台 1C2G 的 k3s 跑这个完全没压力。
+
+---
+
+## 八、标准 k8s（kubeadm / k0s / RKE2）从零走一遍
+
+前面二～七节的动作完全一样，这里只补差异部分。前提：`kubectl get nodes` 正常，
+节点上跑的是 containerd（kubeadm 默认就是）。
+
+### 1. 存储：有没有默认 StorageClass
+
+```bash
+kubectl get sc
+```
+
+- 输出里有带 `(default)` 的 → **这一步跳过**，什么都不用做
+- 一个都没有 → PVC 会永远 Pending，Pod 一直 `ContainerCreating`
+
+补一个最简单的（单节点够用，多节点请上 Longhorn / NFS）：
+
+```yaml
+# todo-pv.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: todo-data-pv
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain    # 删 PVC 不删数据
+  storageClassName: todo-local
+  hostPath:
+    path: /opt/data/todo
+    type: DirectoryOrCreate
+```
+
+```bash
+kubectl apply -f todo-pv.yaml
+./deploy.sh --storage-class todo-local --html ../www/index.html
+```
+
+注意 `storageClassName` 那两个地方必须是**同一个名字**（PV 里叫 `todo-local`，
+`--storage-class` 也传 `todo-local`），否则 PVC 绑不上。
+
+### 2. 镜像：单节点直接导，多节点走仓库
+
+**单节点**（和 k3s 一样，一条命令）：
+
+```bash
+./deploy.sh --html ../www/index.html
+```
+
+脚本会用 `ctr -n k8s.io` 把镜像导进 containerd。想手动做就是这三条：
+
+```bash
+ctr -n k8s.io images import /tmp/todo-push.tar          # 自己 build 的那个
+ctr -n k8s.io images pull --platform linux/amd64 \
+    docker.m.daocloud.io/library/nginx:1.27-alpine
+ctr -n k8s.io images tag \
+    docker.m.daocloud.io/library/nginx:1.27-alpine \
+    docker.io/library/nginx:1.27-alpine
+```
+
+`-n k8s.io` 不能省。用 `ctr images import`（默认 `default` 命名空间）导进去，
+`ctr images ls` 看得到、`crictl images` 看不到、Pod 起来还是 `ImagePullBackOff`——
+这个坑花的时间足够你把整份文档读三遍。
+
+**多节点**：镜像必须推到仓库，否则 Pod 调度到没导镜像的节点就拉不到。
+
+```bash
+docker login registry.example.com
+./deploy.sh --registry registry.example.com/todo --html ../www/index.html
+```
+
+私有仓库还要让节点能拉，二选一：
+
+```bash
+# A. 只给这个命名空间用（推荐，最小权限）
+kubectl -n todo create secret docker-registry regcred \
+  --docker-server=registry.example.com \
+  --docker-username=robot --docker-password='***'
+```
+
+然后给 Pod 加上（`deploy.sh` 不会自动加，一处 Deployment 一处说明）：
+
+```yaml
+    spec:
+      imagePullSecrets:
+        - name: regcred
+```
+
+```bash
+# B. 挂在 default ServiceAccount 上（影响整个命名空间）
+kubectl -n todo patch serviceaccount default \
+  -p '{"imagePullSecrets":[{"name":"regcred"}]}'
+```
+
+顺手提醒：清单里是 `imagePullPolicy: IfNotPresent`，**同名 tag 重复推不会自动
+更新**。要发新版本请改 tag（`todo-push:1.1`），别指望 push 完节点就会换。
+
+### 3. 想用域名 / 80 端口
+
+清单默认 NodePort 30080，不依赖任何 Ingress。集群里有 ingress-nginx 的话可以加：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: todo
+  namespace: todo
+spec:
+  ingressClassName: nginx          # kubectl get ingressclass 看一眼你的叫什么
+  rules:
+    - host: todo.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: todo-web
+                port:
+                  number: 80
+```
+
+### 4. 自检
+
+```bash
+./check.sh                        # 在节点上，走 127.0.0.1:30080
+./check.sh --host 10.0.0.5        # 从别的机器，换成节点 IP
+```
+
+### 5. 报错对照
+
+| 现象 | 原因 |
+|---|---|
+| Pod `ContainerCreating`，`describe` 里 `pod has unbound immediate PersistentVolumeClaims` | 没有可用 StorageClass，做上面第 1 步 |
+| PVC `Pending`，`describe pvc` 里 `no persistent volumes available` | 写了 `storageClassName` 但没有对应的 PV/供应器，名字对不上 |
+| `ImagePullBackOff`，Events 里 `failed to pull` | 镜像不在该节点（多节点）；或私有仓库没配 `imagePullSecrets` |
+| Events 里 `forbidden: violates PodSecurity "restricted:latest"` | 命名空间开了 restricted，nginx 要 root 起 master。给这个命名空间打 `baseline`：`kubectl label ns todo pod-security.kubernetes.io/enforce=baseline` |
+| 首页 403，其余都正常 | 网页没传进卷：`./deploy.sh --skip-build --html ../www/index.html` |
+| 首页 000 / 连不上 | 云安全组没放行 30080；或 `kubectl get svc todo-web` 的 nodePort 不是 30080 |
+
+---
+
+## 九、脚本是怎么判断"这是 k3s 还是标准 k8s"的
+
+不想读代码就看这三行结论：
+
+| 判断 | 顺序 |
+|---|---|
+| kubectl | 有 `kubectl` 用 `kubectl` → 只有 `k3s` 用 `k3s kubectl` → 只有 `microk8s` 用 `microk8s kubectl` |
+| 镜像后端 | `k3s ctr` → `ctr -n k8s.io` → `nerdctl -n k8s.io` → `crictl` |
+| 数据目录 | 先读 PV 的 `hostPath.path`，再试 `/var/lib/rancher/k3s/storage/*_todo_todo-data`、`/opt/local-path-provisioner/*` |
+
+全部在 `runtime.sh` 里，四个脚本共用。想强制指定可以临时改这个文件，或者在
+`deploy.sh` 里传 `--registry`（这样就完全不走本地导入，用不到运行时探测）。
