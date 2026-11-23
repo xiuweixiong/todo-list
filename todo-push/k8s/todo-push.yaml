@@ -1,0 +1,278 @@
+# 待办清单 · k3s 部署清单（一个文件装完所有东西）
+#
+#   kubectl apply -f todo-push.yaml
+#
+# 包含：命名空间 / 存储卷 / nginx 配置 / 应用（nginx+api 两个容器一个 Pod）
+#      / 对外服务 / 每 15 分钟的推送任务
+#
+# 存储用的是 k3s 自带的 local-path，数据真实落在节点上的
+#   /var/lib/rancher/k3s/storage/pvc-xxxx_todo_todo-data/
+# 想放到自己指定目录（比如 /opt/data/todo），见 README 的「存储」一节。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: todo
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: todo-data
+  namespace: todo
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+# 网页服务的配置。改这里 → kubectl apply → nginx 自动 reload（reload 由 Pod 模板
+# 的 checksum 注解触发，见 deployment 的 annotations）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: todo-nginx
+  namespace: todo
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+
+        # 网页放在卷里，不是打进镜像。换版只 cp 文件，不用重新 build
+        root /data/www;
+        index index.html;
+
+        # 上传的 sqlite 最大 8MB，和 api.py 里的 MAX_BYTES 对齐
+        client_max_body_size 8m;
+
+        # 网页本体 7.6MB，压完 2.5MB 左右，30 个人开起来快很多
+        gzip on;
+        gzip_types text/html application/javascript text/css application/json;
+        gzip_min_length 1024;
+        gzip_vary on;
+
+        # 同步接口转发给同 Pod 的 api 容器，走本地回环，不经过 Service
+        location = /api/todos {
+            proxy_pass http://127.0.0.1:8099;
+            proxy_read_timeout 30s;
+            proxy_send_timeout 30s;
+            # 8MB 的上传不要先缓冲到磁盘，直接流过去
+            proxy_buffering off;
+            proxy_request_buffering off;
+        }
+
+        location = /healthz {
+            proxy_pass http://127.0.0.1:8099;
+            access_log off;
+        }
+
+        # 网页本体不让浏览器长期缓存，否则换了版本用户还是看到旧的
+        location = /index.html {
+            add_header Cache-Control "no-cache";
+        }
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-app
+  namespace: todo
+spec:
+  replicas: 1
+  # 必须 Recreate。RWO 卷 + 滚动更新会出现新旧两个 Pod 抢同一个目录，
+  # 30 个人同时在写的时候容易把库写坏。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: todo-app
+  template:
+    metadata:
+      labels:
+        app: todo-app
+      annotations:
+        # 改了 ConfigMap 内容这个值就变 → Pod 自动重建，nginx 用上新配置。
+        # 换了这个值记得一起改，否则 apply 之后还是旧配置在跑。
+        configmap-rev: "1"
+    spec:
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+
+      # 卷挂上去之前先把目录建好，否则 nginx 因为 root 目录不存在直接 404。
+      # /data/www 必须一起 chown：api 容器是 uid 1000，属主是 root 的话网页传不进去
+      # （表现为 kubectl cp 报 permission denied，或者网页一直 403）。
+      initContainers:
+        - name: init-dirs
+          image: todo-push:1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "mkdir -p /data/www /data/users && chown 1000:1000 /data /data/www /data/users && chmod 775 /data/www"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+      containers:
+        # ---------- 网页 ----------
+        # 官方 nginx 镜像，master 以 root 起、worker 降权到 nginx 用户，
+        # 所以这里不设 runAsUser。它要写 /var/cache/nginx 的临时目录。
+        - name: web
+          image: nginx:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          volumeMounts:
+            # 只读挂载：nginx 只需要读网页，不给它写权限
+            - name: data
+              mountPath: /data
+              readOnly: true
+            - name: nginxconf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+          readinessProbe:
+            # 用端口探测而不是 GET /，这样还没传 html 时 Pod 也算就绪，
+            # 传完立刻能访问，不需要重启
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              memory: 128Mi
+
+        # ---------- 同步接口 ----------
+        - name: api
+          image: todo-push:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: BASE
+              value: /data
+            - name: PORT
+              value: "8099"
+            # 探针是 kubelet 从节点上打 Pod IP 的，必须监听 0.0.0.0，
+            # 写 127.0.0.1 的话健康检查永远失败
+            - name: BIND
+              value: 0.0.0.0
+          ports:
+            - name: api
+              containerPort: 8099
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: todo-data
+        - name: nginxconf
+          configMap:
+            name: todo-nginx
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: todo-web
+  namespace: todo
+spec:
+  # 没域名，走 NodePort 最省事，不和已有的 Traefik 抢 80
+  type: NodePort
+  selector:
+    app: todo-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 30080
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: todo-push
+  namespace: todo
+spec:
+  # 每 15 分钟醒一次，脚本自己判断"谁到点了、今天推过没有"。
+  # 这里故意不写 timeZone 字段：k8s 1.27 之前不认这个字段会报错，
+  # 而脚本内部一律用 TZ=Asia/Shanghai 取时间，所以调度按 UTC 跑也完全正确。
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # 失败不重试：Server酱 发送失败也计额度，重试逻辑由脚本自己控
+      # （默认 1 次正常 + 2 次重试，可用 MAX_TRIES 覆盖）
+      backoffLimit: 0
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: todo-push
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+          containers:
+            - name: push
+              image: todo-push:1.0
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - /opt/todo-push/push-all.sh
+              env:
+                - name: BASE
+                  value: /data
+                - name: TZ
+                  value: Asia/Shanghai
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  memory: 128Mi
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: todo-data

@@ -1,0 +1,25 @@
+[Unit]
+Description=待办清单同步接口
+After=network.target
+
+[Service]
+Type=simple
+User=todopush
+Group=todopush
+WorkingDirectory=/opt/todo-push
+Environment=BASE=/opt/todo-push
+Environment=PORT=8099
+Environment=BIND=127.0.0.1
+ExecStart=/usr/bin/python3 /opt/todo-push/api.py
+Restart=always
+RestartSec=3
+
+# 收紧权限：只读系统，只允许写数据目录
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/opt/todo-push
+
+[Install]
+WantedBy=multi-user.target

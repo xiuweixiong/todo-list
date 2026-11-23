@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────
+# 白名单策略：先全部忽略，再逐项放行。
+#
+# 这个目录里同时躺着约 700MB 的浏览器 profile 缓存（GrShaderCache、
+# Default/）、历代预览截图和十几个发布 zip。黑名单写漏一条就会把它们
+# 塞进仓库且几乎无法撤除，所以反过来写：新出现的临时文件默认不进来。
+# ─────────────────────────────────────────────────────────────
+/*
+
+# 根目录这几个文件要
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/LICENSE
+
+# 目录要（是否放行里面的具体文件，由下面各段决定）
+!/todo-push/
+!/_build/
+!/todo-app/
+!/docs/
+!/待办应用-设计卡.md
+
+# ── todo-app：只放行构建产物那一个文件，方便别人下载后直接双击使用 ──
+# 测试数据、_backup 里的旧版数据一律不进库
+/todo-app/*
+!/todo-app/待办清单.html
+
+# ── _build：只保留"重新构建出单文件"所需的源码，其余全是截图和历史版本 ──
+/_build/*
+!/_build/build.py
+!/_build/pack_push.py
+!/_build/template.html
+!/_build/sql-wasm.js
+!/_build/sql-wasm.wasm
+!/_build/live2d/
+/_build/live2d/*
+!/_build/live2d/live2d_embed.js
+!/_build/live2d/live2dcubismcore.min.js
+!/_build/live2d/pixi.min.js
+!/_build/live2d/cubism4.min.js
+
+# ── 部署副本：和 todo-app/待办清单.html 是同一个文件（md5 一致），
+#    只入库一份就够，部署脚本会自己 fallback 到 todo-app 那份 ──
+/todo-push/www/index.html
+
+# ── 通用垃圾 ──
+**/*.zip
+**/*.sqlite
+**/*.db
+**/Thumbs.db
+**/.DS_Store
+.workbuddy/
