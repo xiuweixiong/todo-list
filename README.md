@@ -4,7 +4,7 @@
 
 可选再自建一台很小的服务器，就能变成**多用户**（一人一个目录、互相看不见）并且**每天早上收到一条微信待办汇总**。
 
-> **直接用**：[下载 `todo-app/待办清单.html`](todo-app/待办清单.html)，双击打开就是全部，不需要安装任何东西。
+> **直接用**：[点这里下载 `待办清单.html`](https://github.com/xiuweixiong/todo-list/raw/main/todo-app/%E5%BE%85%E5%8A%9E%E6%B8%85%E5%8D%95.html)（7.8MB，点开即下载，双击打开就是全部，不需要安装任何东西）。
 
 <p>
   <img src="docs/screenshots/list-desktop.png" width="49%" alt="浅色模式">
@@ -39,7 +39,7 @@
 
 ## 用法一：只要本地使用
 
-不需要服务器，也不需要构建——仓库里的 [`todo-app/待办清单.html`](todo-app/待办清单.html) 就是成品，下载后双击打开即可。
+不需要服务器，也不需要构建——仓库里的 [`todo-app/待办清单.html`](https://github.com/xiuweixiong/todo-list/raw/main/todo-app/%E5%BE%85%E5%8A%9E%E6%B8%85%E5%8D%95.html) 就是成品，下载后双击打开即可。
 
 想自己从头构建（改了界面、换了配色之类）：
 
