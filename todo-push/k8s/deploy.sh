@@ -175,17 +175,21 @@ trap 'rm -rf "$TMPD"' EXIT
 SPLIT_DIR="$TMPD" awk '
   BEGIN { n = 0; d = ENVIRON["SPLIT_DIR"] }
   /^---[[:space:]]*$/ { n++; next }
-  { print > (d "/m" n ".yaml") }
+  { print > (d "/doc" n ".yaml") }
 ' todo-push.yaml
 
 NS_FILE=""; PVC_FILE=""; REST=()
-for f in "$TMPD"/m*.yaml; do
+for f in "$TMPD"/doc*.yaml; do
   [ -f "$f" ] || continue
-  grep -q '^kind:' "$f" || { rm -f "$f"; continue; }
-  case "$(grep -m1 '^kind:' "$f" | awk '{print $2}')" in
-    Namespace)               NS_FILE=$f ;;
-    PersistentVolumeClaim)   PVC_FILE=$f ;;
-    *)                       REST+=("$f") ;;
+  KIND=$(grep -m1 '^kind:' "$f" | awk '{print $2}')
+  [ -n "$KIND" ] || { rm -f "$f"; continue; }
+  # 按 kind 改名：真要报错时，报错信息里的文件名能直接看出是哪个资源
+  NF="$TMPD/$KIND.yaml"
+  [ "$f" = "$NF" ] || mv -f "$f" "$NF"
+  case "$KIND" in
+    Namespace)             NS_FILE=$NF ;;
+    PersistentVolumeClaim) PVC_FILE=$NF ;;
+    *)                     REST+=("$NF") ;;
   esac
 done
 
@@ -228,7 +232,11 @@ fi
 if [ "${#REST[@]}" -eq 0 ]; then
   die "清单解析异常：todo-push.yaml 里没找到 Deployment / Service / CronJob，检查文件有没有被改坏"
 fi
-$K apply -f "${REST[@]}"
+# 一次 apply 多个文件：必须给每个文件各写一个 -f
+# 写成 "apply -f a.yaml b.yaml" 会被 kubectl 拒绝（Unexpected args）
+APPLY_ARGS=()
+for f in "${REST[@]}"; do APPLY_ARGS+=(-f "$f"); done
+$K apply "${APPLY_ARGS[@]}"
 $K -n "$NS" rollout status deploy/todo-app --timeout=180s || \
   die "Pod 没起来，看：$K -n $NS describe pod -l app=todo-app
    常见原因：PVC 没绑上（kubectl -n $NS get pvc）、镜像不在节点（kubectl -n $NS describe pod 看 Events）"
