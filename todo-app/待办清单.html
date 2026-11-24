@@ -230,6 +230,30 @@
   .syncnote { font-size: 12px; color: var(--mute); line-height: 1.75; margin: 12px 0 0; }
   .syncnote b { color: var(--dim); font-weight: 500; }
 
+  /* ── 自动同步：一行小开关，沿用字段高度对齐右侧时间框 ── */
+  .syncrow { margin-top: 14px; }
+  .swt {
+    display: inline-flex; align-items: center; gap: 9px; height: 44px;
+    cursor: pointer; user-select: none; -webkit-user-select: none;
+  }
+  .swt input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  .swi {
+    position: relative; flex: none; width: 40px; height: 24px; border-radius: 12px;
+    background: var(--cb-bg); box-shadow: inset 0 0 0 1px var(--cb-bd);
+    transition: background .18s ease, box-shadow .18s ease;
+  }
+  .swi::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px;
+    border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .22);
+    transition: transform .18s ease;
+  }
+  .swt input:checked + .swi { background: var(--primary); box-shadow: inset 0 0 0 1px var(--primary); }
+  .swt input:checked + .swi::after { transform: translateX(16px); }
+  .swt input:focus-visible + .swi { box-shadow: 0 0 0 3px var(--ring); }
+  .swt .swl { font-size: 13.5px; color: var(--dim); }
+  .synchint { font-size: 12px; color: var(--mute); line-height: 1.7; margin: 9px 0 0; }
+  .synchint.warn { color: var(--red-fg); }
+
   /* ── 优先级：带颜色的小圆 + 文字，选中变实心打勾 ── */
   .prio-row { display: flex; gap: 10px; flex-wrap: wrap; }
   .prio {
@@ -720,6 +744,22 @@
       </label>
     </div>
 
+    <div class="nprow2 syncrow">
+      <div class="fld">
+        <span class="flabel">自动同步 <span class="fopt">到点自己上传</span></span>
+        <label class="swt" title="每天到点自动把本机数据传到服务器">
+          <input type="checkbox" id="syncAuto">
+          <span class="swi" aria-hidden="true"></span>
+          <span class="swl" id="syncAutoLabel">开启</span>
+        </label>
+      </div>
+      <label class="fld">
+        <span class="flabel">同步时间</span>
+        <input class="finput" id="syncAutoAt" type="text" placeholder="00:00" maxlength="5" inputmode="numeric">
+      </label>
+    </div>
+    <p class="synchint" id="syncHint"></p>
+
     <div class="syncfoot">
       <button class="primary" id="syncUp" type="button">立即上传</button>
       <button class="btn-plain" id="syncDown" type="button">从云端拉回</button>
@@ -728,6 +768,7 @@
 
     <p class="syncnote">
       只上传待办内容，传到 <b>你自己填的这台服务器</b>，用来生成每天早上那条微信提醒。<br>
+      自动同步<b>每天只传一次</b>：页面开着就等到点传；页面没开，下次打开时补传。<br>
       数据平时仍存在本机浏览器里，服务器连不上也不影响使用。设备码等于钥匙，别发给别人。
     </p>
   </section>
@@ -1697,6 +1738,10 @@ else if (typeof exports === 'object'){
   var SYNC_KEY_KEY = "todo_sync_key_v1";
   var SYNC_AT_KEY = "todo_sync_at_v1";
   var SYNC_LAST_KEY = "todo_sync_last_v1";
+  var SYNC_AUTO_KEY = "todo_sync_auto_v1";     // 自动同步开关：1 开 / 0 关
+  var SYNC_AUTOAT_KEY = "todo_sync_autoat_v1"; // 每天几点自动传，HH:MM
+  var SYNC_DAY_KEY = "todo_sync_day_v1";       // 已经自动传过哪个「同步日」
+  var SYNC_FAILS_KEY = "todo_sync_fails_v1";   // 当前同步日失败次数：「日期 次数」
   var TOKEN_RE = /^[0-9a-f]{32}$/;
 
   var syncPanelEl = document.getElementById("syncPanel");
@@ -1707,6 +1752,10 @@ else if (typeof exports === 'object'){
   var syncStateEl = document.getElementById("syncState");
   var syncUpEl = document.getElementById("syncUp");
   var syncDownEl = document.getElementById("syncDown");
+  var syncAutoEl = document.getElementById("syncAuto");
+  var syncAutoLabelEl = document.getElementById("syncAutoLabel");
+  var syncAutoAtEl = document.getElementById("syncAutoAt");
+  var syncHintEl = document.getElementById("syncHint");
 
   function lsGet(k, dflt) {
     try {
@@ -1833,10 +1882,135 @@ else if (typeof exports === 'object'){
     syncState(s ? "上次同步：" + s : "尚未同步");
   }
 
+  // ── 自动同步 ──
+  // 网页没有后台进程：标签页关掉，定时器就停了，改不动这一点（纯 HTTP + IP 也用不了
+  // Service Worker / 后台同步，那些要求 HTTPS 且浏览器只支持 Chrome）。所以做三层：
+  //   1. 页面开着 → 每 30 秒看一次到没到点
+  //   2. 页面没开 → 下次打开时补传（按「同步日」判断，一天只自动传一次）
+  //   3. 切回标签页 / 网络恢复 → 立刻再判一次
+  var AUTO_EVERY = 30000;
+  var AUTO_COOLDOWN = 5 * 60000;  // 失败后先歇 5 分钟，别每 30 秒打一次服务器
+  var AUTO_MAX_FAILS = 3;         // 同一个同步日失败 3 次就不再自动重试
+  var autoTimer = null, autoBusy = false, autoFailAt = 0;
+
+  function autoOn() { return lsGet(SYNC_AUTO_KEY, "1") !== "0"; }
+
+  // 「同步日」：以设定的同步时间划天。没到点算昨天，到点之后算今天。
+  // 00:00 的含义因此是：当天 0 点以后第一次有机会，就传一次。
+  function syncDayKey() {
+    var at = hhmm(syncAutoAtEl.value) || "00:00";
+    var now = new Date();
+    var p = new Date(now.getFullYear(), now.getMonth(), now.getDate(),
+                     Number(at.slice(0, 2)), Number(at.slice(3, 5)), 0, 0);
+    if (now.getTime() < p.getTime()) p.setDate(p.getDate() - 1);
+    return dateStr(p);
+  }
+
+  // 双击打开本地文件又没填服务器地址 → 无处可传，别弹错、别重试
+  function autoConfigured() {
+    return syncBase(syncUrlEl.value) !== "" || location.protocol !== "file:";
+  }
+
+  function autoFails() {
+    var parts = String(lsGet(SYNC_FAILS_KEY, "")).split(" ");
+    var n = Number(parts[1]);
+    if (parts[0] !== syncDayKey() || !n || n < 0) return 0;
+    return Math.floor(n);
+  }
+
+  function autoPending() {
+    return autoOn() && autoConfigured() && lsGet(SYNC_DAY_KEY, "") !== syncDayKey();
+  }
+
+  // 面板上那行小字：把「为什么现在不传」说清楚，不留黑盒
+  function autoHint() {
+    if (!autoOn()) return "已关闭：只能点「立即上传」手动传";
+    if (!autoConfigured()) return "还没填服务器地址，自动同步不会执行";
+    if (autoFails() >= AUTO_MAX_FAILS) {
+      return "今天已连续失败 " + AUTO_MAX_FAILS + " 次，今天不再自动重试（可点「立即上传」手动试）";
+    }
+    var at = hhmm(syncAutoAtEl.value) || "00:00";
+    if (!autoPending()) return "每天 " + at + " 自动传一次 · 今天已经传过了";
+    return "每天 " + at + " 自动传一次 · 页面没开就在下次打开时补传";
+  }
+
+  function refreshAutoUI() {
+    var on = autoOn();
+    syncAutoEl.checked = on;
+    syncAutoLabelEl.textContent = on ? "开启" : "关闭";
+    syncAutoAtEl.disabled = !on;
+    syncAutoAtEl.value = hhmm(syncAutoAtEl.value) || "00:00";
+    var warn = on && autoFails() >= AUTO_MAX_FAILS;
+    syncHintEl.textContent = autoHint();
+    syncHintEl.className = "synchint" + (warn ? " warn" : "");
+  }
+
+  // 自动上传：不弹校验错误、不抢用户的面板焦点，只在状态行和 toast 上报结果
+  function autoUpload() {
+    var tok = syncCodeEl.value.trim().toLowerCase();
+    if (!TOKEN_RE.test(tok)) tok = deviceCode();
+    var body;
+    try { body = db.export(); } catch (e) { return; }
+
+    autoBusy = true;
+    syncBusy(true);
+    syncState("自动同步中…");
+    fetch(syncBase(syncUrlEl.value) + "/api/todos", {
+      method: "PUT",
+      headers: syncHeaders(tok),
+      body: body,
+      cache: "no-store"
+    }).then(function (r) {
+      return r.text().then(function (t) {
+        if (!r.ok) throw new Error(httpFail(r, t));
+      });
+    }).then(function () {
+      var ms = Date.now();
+      lsSet(DEVICE_KEY, tok);
+      lsSet(SYNC_LAST_KEY, String(ms));
+      lsSet(SYNC_DAY_KEY, syncDayKey());
+      lsSet(SYNC_FAILS_KEY, "");
+      autoFailAt = 0;
+      autoBusy = false;
+      syncBusy(false);
+      syncState("上次同步：" + fmtStamp(ms));
+      saveSyncFields();
+      refreshAutoUI();
+      toast("已自动同步（" + Math.max(1, Math.round(body.length / 1024)) + " KB）");
+    }).catch(function (e) {
+      var msg = netMsg(e);
+      autoBusy = false;
+      syncBusy(false);
+      autoFailAt = Date.now();
+      lsSet(SYNC_FAILS_KEY, syncDayKey() + " " + (autoFails() + 1));
+      syncState("自动同步失败：" + msg, true);
+      refreshAutoUI();
+    });
+  }
+
+  function autoTick(force) {
+    if (autoBusy || !autoPending()) return;
+    if (autoFails() >= AUTO_MAX_FAILS) return;
+    if (!force && Date.now() - autoFailAt < AUTO_COOLDOWN) return;
+    autoUpload();
+  }
+
+  function startAuto() {
+    refreshAutoUI();
+    if (!autoTimer) autoTimer = setInterval(function () { autoTick(false); }, AUTO_EVERY);
+    // 给 2 秒等数据库初始化完，再判一次「昨天该传没传」
+    setTimeout(function () { autoTick(true); }, 2000);
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) autoTick(false);
+    });
+    window.addEventListener("online", function () { autoTick(true); });
+  }
+
   function openSync() {
     // 故意不去动「新建待办」面板：用户可能正填到一半，切过去看一眼不该丢内容
     syncPanelEl.hidden = false;
     showLastSync();
+    refreshAutoUI();
     if (!syncUrlEl.value && location.protocol !== "file:") syncUrlEl.placeholder = location.origin;
     try { syncPanelEl.scrollIntoView({ behavior: "smooth", block: "nearest" }); } catch (e) {}
   }
@@ -1921,9 +2095,13 @@ else if (typeof exports === 'object'){
       lsSet(DEVICE_KEY, tok);
       var ms = Date.now();
       lsSet(SYNC_LAST_KEY, String(ms));
+      // 手动传过就算今天已完成，别让自动同步再传一遍
+      lsSet(SYNC_DAY_KEY, syncDayKey());
+      lsSet(SYNC_FAILS_KEY, "");
       syncState("上次同步：" + fmtStamp(ms));
       syncBusy(false);
       saveSyncFields();
+      refreshAutoUI();
       toast("已上传（" + Math.max(1, Math.round(body.length / 1024)) + " KB）");
     }).catch(function (e) {
       syncBusy(false);
@@ -1960,9 +2138,13 @@ else if (typeof exports === 'object'){
       render();
       var ms = Date.now();
       lsSet(SYNC_LAST_KEY, String(ms));
+      // 刚拉回来，本机和云端一致，今天不必再自动传
+      lsSet(SYNC_DAY_KEY, syncDayKey());
+      lsSet(SYNC_FAILS_KEY, "");
       syncState("上次同步：" + fmtStamp(ms));
       syncBusy(false);
       saveSyncFields();
+      refreshAutoUI();
       toast("已从云端拉回");
     }).catch(function (e) {
       syncBusy(false);
@@ -2049,6 +2231,7 @@ else if (typeof exports === 'object'){
     syncUrlEl.value = lsGet(SYNC_URL_KEY, "");
     syncKeyEl.value = lsGet(SYNC_KEY_KEY, "");
     syncAtEl.value = lsGet(SYNC_AT_KEY, "08:00");
+    syncAutoAtEl.value = lsGet(SYNC_AUTOAT_KEY, "00:00");
     syncCodeEl.value = deviceCode();
     showLastSync();
 
@@ -2078,8 +2261,26 @@ else if (typeof exports === 'object'){
       syncAtEl.value = v || "08:00";
       saveSyncFields();
     });
-    syncUrlEl.addEventListener("change", saveSyncFields);
+    syncUrlEl.addEventListener("change", function () {
+      saveSyncFields();
+      refreshAutoUI();
+      autoTick(true);
+    });
     syncKeyEl.addEventListener("change", saveSyncFields);
+
+    // 自动同步：开关 + 时间，改完立刻落盘，关掉后不再有任何定时请求
+    syncAutoEl.addEventListener("change", function () {
+      lsSet(SYNC_AUTO_KEY, syncAutoEl.checked ? "1" : "0");
+      refreshAutoUI();
+      if (syncAutoEl.checked) autoTick(true);
+    });
+    syncAutoAtEl.addEventListener("change", function () {
+      var v = hhmm(syncAutoAtEl.value);
+      syncAutoAtEl.value = v || "00:00";
+      lsSet(SYNC_AUTOAT_KEY, syncAutoAtEl.value);
+      refreshAutoUI();
+    });
+    startAuto();
   }
 
   function runSelfTest() {
@@ -2240,6 +2441,22 @@ else if (typeof exports === 'object'){
       ok("推送时间补零", hhmm("8:5") === "08:05" && hhmm("08:05") === "08:05", hhmm("8:5"));
       ok("非法推送时间被拒", hhmm("25:99") === "" && hhmm("8点") === "" && hhmm("") === "");
       ok("设备码是32位十六进制", TOKEN_RE.test(deviceCode()) && deviceCode().length === 32, deviceCode());
+
+      // 自动同步：同步日边界 + 失败计数按天失效（不能一次失败就永久停推）
+      var keepAt = syncAutoAtEl.value, keepFails = lsGet(SYNC_FAILS_KEY, "");
+      syncAutoAtEl.value = "00:00";
+      ok("同步日 00:00 算今天", syncDayKey() === todayStr(), syncDayKey());
+      syncAutoAtEl.value = "23:59";
+      var yest = new Date(); yest.setDate(yest.getDate() - 1);
+      var nowHM = pad2(new Date().getHours()) + ":" + pad2(new Date().getMinutes());
+      ok("同步日 没到点算昨天",
+        syncDayKey() === (nowHM === "23:59" ? todayStr() : dateStr(yest)), syncDayKey());
+      lsSet(SYNC_FAILS_KEY, "2000-01-01 3");
+      ok("昨天记的失败次数不算数", autoFails() === 0, String(autoFails()));
+      lsSet(SYNC_FAILS_KEY, syncDayKey() + " 2");
+      ok("当天失败次数读得对", autoFails() === 2, String(autoFails()));
+      lsSet(SYNC_FAILS_KEY, keepFails);
+      syncAutoAtEl.value = keepAt;
 
       // 云同步：云端拿回来的库必须校验收得住，坏文件不能覆盖本机
       var t11 = new SQL.Database();
