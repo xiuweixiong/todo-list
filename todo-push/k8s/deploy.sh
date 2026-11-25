@@ -105,7 +105,8 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     note "apt 源：$APT_MIRROR"
   fi
 
-  if ! docker build "${BUILD_ARGS[@]}" -t "$LOCAL_TAG" ../ 2>&1 | tail -40; then
+  # ${arr[@]+...}：bash 4.4 之前，set -u 下展开空数组会报「未绑定的变量」
+  if ! docker build ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -t "$LOCAL_TAG" ../ 2>&1 | tail -40; then
     cat <<'HINT'
 
     构建失败。对号入座：
@@ -162,7 +163,7 @@ else
     IMPORT_ARGS+=(--nginx-ref "$NGINX_REF")
     note "nginx 来源：$NGINX_REF"
   fi
-  bash ./import.sh "${IMPORT_ARGS[@]}" || die "镜像没进节点。上面有逐条结论，Pod 现在起了也会 ImagePullBackOff"
+  bash ./import.sh ${IMPORT_ARGS[@]+"${IMPORT_ARGS[@]}"} || die "镜像没进节点。上面有逐条结论，Pod 现在起了也会 ImagePullBackOff"
 fi
 
 # ---------- 3. 部署 ----------
@@ -205,7 +206,7 @@ fi
 
 # 用私有仓库时，把清单里的镜像名换掉
 if [ -n "$REGISTRY" ]; then
-  for f in "${REST[@]}"; do
+  for f in ${REST[@]+"${REST[@]}"}; do
     sed -i "s|image: $LOCAL_TAG|image: $IMG|g" "$f"
   done
 fi
@@ -235,7 +236,7 @@ fi
 # 一次 apply 多个文件：必须给每个文件各写一个 -f
 # 写成 "apply -f a.yaml b.yaml" 会被 kubectl 拒绝（Unexpected args）
 APPLY_ARGS=()
-for f in "${REST[@]}"; do APPLY_ARGS+=(-f "$f"); done
+for f in ${REST[@]+"${REST[@]}"}; do APPLY_ARGS+=(-f "$f"); done
 $K apply "${APPLY_ARGS[@]}"
 $K -n "$NS" rollout status deploy/todo-app --timeout=180s || \
   die "Pod 没起来，看：$K -n $NS describe pod -l app=todo-app

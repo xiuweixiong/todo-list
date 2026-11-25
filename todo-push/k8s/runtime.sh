@@ -121,7 +121,7 @@ rt_img_pull() {
       local pargs=()
       [ -n "$platform" ] && pargs+=(--platform "$platform")
       # shellcheck disable=SC2086  # cmd 需要按空格拆成多个词
-      $cmd "${pargs[@]}" "$ref"
+      $cmd ${pargs[@]+"${pargs[@]}"} "$ref"
       ;;
     crictl)
       # crictl 只能按最终名拉，拉完名字天然就是对的
