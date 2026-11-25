@@ -1,6 +1,13 @@
 # 待办清单 · k8s 部署清单（一个文件装完所有东西）
 #
-#   kubectl apply -f todo-push.yaml
+#   kubectl apply -f todo-push.yaml        ← 只改配置就用这个
+#
+# ⚠⚠ 千万不要用 kubectl delete -f todo-push.yaml ⚠⚠
+#    这个文件第一段是 Namespace，delete 会把整个命名空间删掉，
+#    PVC 跟着删、PVC 一删用户待办数据就没了（local-path 会清掉目录）。
+#    而且命名空间会进入 Terminating 状态，期间新建任何资源都报
+#    "namespace todo is being terminated"，重部署要等它彻底消失。
+#    要清干净：先 ./backup.sh，再一个资源一个资源删，别整文件删。
 #
 # 包含：命名空间 / 存储卷 / nginx 配置 / 应用（nginx+api 两个容器一个 Pod）
 #      / 对外服务 / 每 15 分钟的推送任务

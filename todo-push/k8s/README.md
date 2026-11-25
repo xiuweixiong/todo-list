@@ -658,3 +658,75 @@ spec:
 
 全部在 `runtime.sh` 里，四个脚本共用。想强制指定可以临时改这个文件，或者在
 `deploy.sh` 里传 `--registry`（这样就完全不走本地导入，用不到运行时探测）。
+
+---
+
+## 十、千万别 `kubectl delete -f todo-push.yaml`
+
+这个文件第一段是 **Namespace**。`delete -f` 会把整个命名空间删掉：
+
+```
+Namespace todo ──┬── Deployment / Service / CronJob   （删了没事，重新 apply 就有）
+                 └── PVC todo-data ──── 用户全部待办数据   ← 这个删了就真没了
+```
+
+`local-path` 这类本地供应器的回收策略是 Delete，PVC 一删，节点上那个目录
+（`/var/lib/rancher/k3s/storage/pvc-xxx_todo_todo-data/`）跟着被清掉，**没有回收站**。
+
+**只改配置就用 apply**，apply 是幂等的，改多少遍都不会删数据。
+真要重来：先 `./backup.sh`，然后只删应用层：
+
+```bash
+kubectl -n todo delete deploy todo-app
+kubectl -n todo delete cronjob todo-push
+kubectl -n todo delete cm todo-nginx
+kubectl -n todo delete svc todo-web
+kubectl -n todo delete pvc todo-data      # ← 只有这句会毁数据，想清楚再敲
+```
+
+### 命名空间卡在 Terminating 怎么救
+
+删掉命名空间后它会先进入 `Terminating`，期间**任何新建资源的请求都会被拒**：
+
+```
+unable to create new content in namespace todo because it is being terminated
+```
+
+正常情况几十秒自己消失。卡住通常是这两件事：
+
+**1. Pod 还没退干净**（有 Pod 在用 PVC，PVC 就删不掉，命名空间就结束不了）
+
+```bash
+kubectl -n todo get pod
+kubectl -n todo delete pod --all --force --grace-period=0
+```
+
+**2. PVC 的 finalizer 没被摘掉**
+
+```bash
+kubectl -n todo get pvc todo-data -o jsonpath='{.metadata.finalizers}{"\n"}'
+# 通常剩 kubernetes.io/pvc-protection
+```
+
+Pod 清光后它一般会自己掉；还不掉就手动摘：
+
+```bash
+kubectl -n todo patch pvc todo-data -p '{"metadata":{"finalizers":null}}' --type=merge
+```
+
+**3. 还不动，说明命名空间本身有 finalizer 卡着**，直接改它的 finalize 接口：
+
+```bash
+kubectl get ns todo -o json > /tmp/ns.json
+python3 - <<'PY'
+import json
+d = json.load(open("/tmp/ns.json"))
+d["spec"]["finalizers"] = []
+json.dump(d, open("/tmp/ns-final.json", "w"))
+PY
+kubectl replace --raw "/api/v1/namespaces/todo/finalize" -f /tmp/ns-final.json
+kubectl get ns todo          # 没输出 = 已经彻底没了
+```
+
+清完 `./deploy.sh --html ../www/index.html` 会重新建命名空间、PVC、把网页传上去。
+注意：**数据是新的空库**，除非你有 `backup.sh` 的备份。

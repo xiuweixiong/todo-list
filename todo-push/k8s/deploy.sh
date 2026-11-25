@@ -169,6 +169,23 @@ fi
 # ---------- 3. 部署 ----------
 say "3/5 应用清单"
 
+# 命名空间正在删除时，后面每一次 apply 都会被拒（is being terminated），
+# 提前说清楚原因，别让人对着一句 Forbidden 猜
+NS_PHASE=$($K get namespace "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+if [ "$NS_PHASE" = "Terminating" ]; then
+  die "命名空间 $NS 正在删除中（Terminating），现在创建任何资源都会被拒。
+
+  最可能的原因：执行过 kubectl delete -f todo-push.yaml
+  （那个文件第一段就是 Namespace，删它会连 PVC 和用户数据一起带走）
+
+  三步处理：
+    1) 看还卡着什么：   $K -n $NS get pod,pvc,cronjob
+    2) 催它走：         $K -n $NS delete pod --all --force --grace-period=0
+                        $K -n $NS delete pvc --all --ignore-not-found
+    3) 等 $K get ns $NS 完全没有输出，再重跑本脚本
+  还不动就是 finalizer 卡住，见 k8s/README.md 最后一节"
+fi
+
 # 把多文档清单拆开，才能做到"已有 PVC 不重复 apply"
 TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
